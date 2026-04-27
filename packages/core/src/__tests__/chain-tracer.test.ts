@@ -17,7 +17,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  await fs.rm(tmpDir, { recursive: true, force: true });
+  if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true });
 });
 
 async function makeSkill(
@@ -158,18 +158,19 @@ describe('chain-tracer: JS require() chain', () => {
     });
 
     const files = await ingestSkillDirectory(skillDir);
-    const adapter = new RegexAdapter();
-    const staticFindings = await adapter.scan(files, skillDir);
-    const chainFindings = await traceImportChains(files, staticFindings, skillDir);
+    // Use synthetic finding to decouple from RegexAdapter's detection rules
+    const synthetic: Finding = {
+      id: 'TEST-JS-001',
+      category: 'shell_exec',
+      severity: 'high',
+      location: { file: 'lib/helper.js' },
+      message: 'seeded shell exec finding',
+      source: 'static',
+    };
+    const chainFindings = await traceImportChains(files, [synthetic], skillDir);
 
-    // If there are static findings in lib/helper.js (shell exec), chain should trace back to index.js
-    const shellFindings = staticFindings.filter(
-      (f) => f.location.file.includes('helper')
-    );
-    if (shellFindings.length > 0) {
-      expect(chainFindings.length).toBeGreaterThan(0);
-      expect(chainFindings[0]!.chain[0]).toBe('index.js');
-    }
+    expect(chainFindings.length).toBeGreaterThan(0);
+    expect(chainFindings[0]!.chain[0]).toBe('index.js');
   });
 });
 
@@ -185,17 +186,19 @@ describe('chain-tracer: TS import chain', () => {
     });
 
     const files = await ingestSkillDirectory(skillDir);
-    const adapter = new RegexAdapter();
-    const staticFindings = await adapter.scan(files, skillDir);
-    const chainFindings = await traceImportChains(files, staticFindings, skillDir);
+    // Use synthetic finding to decouple from RegexAdapter
+    const synthetic: Finding = {
+      id: 'TEST-TS-001',
+      category: 'shell_exec',
+      severity: 'high',
+      location: { file: 'lib/runner.ts' },
+      message: 'seeded shell exec finding',
+      source: 'static',
+    };
+    const chainFindings = await traceImportChains(files, [synthetic], skillDir);
 
-    const shellFindings = staticFindings.filter(
-      (f) => f.location.file.includes('runner')
-    );
-    if (shellFindings.length > 0) {
-      expect(chainFindings.length).toBeGreaterThan(0);
-      expect(chainFindings[0]!.chain[0]).toBe('main.ts');
-    }
+    expect(chainFindings.length).toBeGreaterThan(0);
+    expect(chainFindings[0]!.chain[0]).toBe('main.ts');
   });
 });
 
@@ -211,18 +214,19 @@ describe('chain-tracer: shell source chain', () => {
     });
 
     const files = await ingestSkillDirectory(skillDir);
-    const adapter = new RegexAdapter();
-    const staticFindings = await adapter.scan(files, skillDir);
-    const chainFindings = await traceImportChains(files, staticFindings, skillDir);
+    // Use synthetic finding to decouple from RegexAdapter
+    const synthetic: Finding = {
+      id: 'TEST-SH-001',
+      category: 'network_access',
+      severity: 'high',
+      location: { file: 'lib/utils.sh' },
+      message: 'seeded network finding',
+      source: 'static',
+    };
+    const chainFindings = await traceImportChains(files, [synthetic], skillDir);
 
-    const networkFindings = staticFindings.filter(
-      (f) => f.location.file.includes('utils.sh')
-    );
-    if (networkFindings.length > 0) {
-      expect(chainFindings.length).toBeGreaterThan(0);
-      const chain = chainFindings[0]!;
-      expect(chain.chain[0]).toBe('setup.sh');
-    }
+    expect(chainFindings.length).toBeGreaterThan(0);
+    expect(chainFindings[0]!.chain[0]).toBe('setup.sh');
   });
 });
 
@@ -232,19 +236,29 @@ describe('chain-tracer: circular imports', () => {
   it('handles circular import without infinite loop', async () => {
     const skillDir = await makeSkill('circular', {
       'SKILL.md': '# Circular',
-      'a.py': 'from b import something\nimport subprocess\nsubprocess.run(["echo"])\n',
+      'entry.py': 'from a import something\n',
+      'a.py': 'from b import something\n',
       'b.py': 'from a import something\n',
     });
 
     const files = await ingestSkillDirectory(skillDir);
-    const adapter = new RegexAdapter();
-    const staticFindings = await adapter.scan(files, skillDir);
+    // Use synthetic finding in the cycle to test traversal
+    const synthetic: Finding = {
+      id: 'TEST-CIRC-001',
+      category: 'shell_exec',
+      severity: 'medium',
+      location: { file: 'b.py' },
+      message: 'seeded finding in cycle',
+      source: 'static',
+    };
     // This should complete without hanging
-    const chainFindings = await traceImportChains(files, staticFindings, skillDir);
+    const chainFindings = await traceImportChains(files, [synthetic], skillDir);
 
-    // Should not throw or hang — result may or may not have chains depending on graph traversal
+    // entry.py imports a.py which imports b.py — chain should exist
     expect(Array.isArray(chainFindings)).toBe(true);
-  });
+    expect(chainFindings.length).toBeGreaterThan(0);
+    expect(chainFindings[0]!.chain[0]).toBe('entry.py');
+  }, 2000);
 });
 
 // ── Test: Python importlib.import_module ──────────────────────────────────────
@@ -259,16 +273,20 @@ describe('chain-tracer: Python importlib.import_module', () => {
     });
 
     const files = await ingestSkillDirectory(skillDir);
-    const adapter = new RegexAdapter();
-    const staticFindings = await adapter.scan(files, skillDir);
-    const chainFindings = await traceImportChains(files, staticFindings, skillDir);
+    // Use synthetic finding to test chain resolution independently
+    const synthetic: Finding = {
+      id: 'TEST-IMP-001',
+      category: 'shell_exec',
+      severity: 'high',
+      location: { file: 'evil.py' },
+      message: 'seeded finding in evil module',
+      source: 'static',
+    };
+    const chainFindings = await traceImportChains(files, [synthetic], skillDir);
 
     // If the chain tracer resolves importlib.import_module("evil") → evil.py,
-    // we should get a chain finding
-    const evilFindings = staticFindings.filter((f) =>
-      f.location.file.includes('evil.py')
-    );
-    if (evilFindings.length > 0 && chainFindings.length > 0) {
+    // we should get a chain finding from loader.py
+    if (chainFindings.length > 0) {
       expect(chainFindings[0]!.chain[0]).toBe('loader.py');
     }
   });
@@ -364,13 +382,21 @@ describe('chain-tracer: diamond dependency', () => {
     });
 
     const files = await ingestSkillDirectory(skillDir);
-    const adapter = new RegexAdapter();
-    const staticFindings = await adapter.scan(files, skillDir);
-    const chainFindings = await traceImportChains(files, staticFindings, skillDir);
+    // Use synthetic finding to decouple from RegexAdapter
+    const synthetic: Finding = {
+      id: 'TEST-DIAMOND-001',
+      category: 'shell_exec',
+      severity: 'critical',
+      location: { file: 'deep/danger.py' },
+      message: 'seeded finding in diamond leaf',
+      source: 'static',
+    };
+    const chainFindings = await traceImportChains(files, [synthetic], skillDir);
 
-    // main.py should be the entry point through both paths
-    expect(chainFindings.length).toBeGreaterThan(0);
-    const entryFiles = chainFindings.map((cf) => cf.chain[0]);
-    expect(entryFiles).toContain('main.py');
+    // entry→terminal dedup: main.py→deep/danger.py should produce exactly 1 chain
+    expect(chainFindings.length).toBe(1);
+    expect(chainFindings[0]!.chain[0]).toBe('main.py');
+    // Chain goes through at least: main.py → left/right → deep/danger.py
+    expect(chainFindings[0]!.chain.length).toBeGreaterThanOrEqual(3);
   });
 });
